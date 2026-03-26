@@ -4,11 +4,7 @@ import https from 'https';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from '../config.js';
-import {
-  getRegisteredGroup,
-  storeChatMetadata,
-  storeMessage,
-} from '../db.js';
+import { getRegisteredGroup, storeChatMetadata, storeMessage } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { Channel, NewMessage } from '../types.js';
@@ -95,7 +91,9 @@ class GitHubChannel implements Channel {
           res.on('end', () => {
             if (res.statusCode && res.statusCode >= 400) {
               reject(
-                new Error(`GitHub API ${res.statusCode} for ${apiPath}: ${data.slice(0, 200)}`),
+                new Error(
+                  `GitHub API ${res.statusCode} for ${apiPath}: ${data.slice(0, 200)}`,
+                ),
               );
               return;
             }
@@ -193,7 +191,8 @@ class GitHubChannel implements Channel {
         tracked.active = true;
         tracked.notified = true;
 
-        const user = (item.user as { login?: string } | null)?.login ?? 'unknown';
+        const user =
+          (item.user as { login?: string } | null)?.login ?? 'unknown';
         const title = String(item.title ?? '');
         const url = String(item.html_url ?? '');
 
@@ -250,7 +249,10 @@ class GitHubChannel implements Channel {
         }
       } catch (err) {
         // If we can't fetch the PR, treat it as gone
-        logger.warn({ key, err }, 'Failed to fetch PR state after disappearing from assigned list');
+        logger.warn(
+          { key, err },
+          'Failed to fetch PR state after disappearing from assigned list',
+        );
         this.emitMessage(
           `PR NO LONGER ACTIVE: ${tracked.owner}/${tracked.repo}#${tracked.number}\nStopping monitoring.`,
         );

@@ -240,7 +240,12 @@ function buildContainerArgs(
   }
 
   // Pass through MCP tokens so the agent runner can configure MCP servers
-  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN, HONEYBADGER_PERSONAL_AUTH_TOKEN } = readEnvFile(['AXIOM_MCP_TOKEN', 'GITHUB_TOKEN', 'HONEYBADGER_PERSONAL_AUTH_TOKEN']);
+  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN, HONEYBADGER_PERSONAL_AUTH_TOKEN } =
+    readEnvFile([
+      'AXIOM_MCP_TOKEN',
+      'GITHUB_TOKEN',
+      'HONEYBADGER_PERSONAL_AUTH_TOKEN',
+    ]);
   if (AXIOM_MCP_TOKEN) {
     args.push('-e', `AXIOM_MCP_TOKEN=${AXIOM_MCP_TOKEN}`);
   }
@@ -248,7 +253,10 @@ function buildContainerArgs(
     args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
   }
   if (HONEYBADGER_PERSONAL_AUTH_TOKEN) {
-    args.push('-e', `HONEYBADGER_PERSONAL_AUTH_TOKEN=${HONEYBADGER_PERSONAL_AUTH_TOKEN}`);
+    args.push(
+      '-e',
+      `HONEYBADGER_PERSONAL_AUTH_TOKEN=${HONEYBADGER_PERSONAL_AUTH_TOKEN}`,
+    );
   }
 
   // Runtime-specific args for host gateway resolution
@@ -291,7 +299,10 @@ export async function runContainerAgent(
   // Write .mcp.json into the group workspace so Claude Code picks it up automatically.
   // This file is at /workspace/group/.mcp.json inside the container (the agent's cwd).
   const mcpConfig: Record<string, unknown> = {};
-  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN } = readEnvFile(['AXIOM_MCP_TOKEN', 'GITHUB_TOKEN']);
+  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN } = readEnvFile([
+    'AXIOM_MCP_TOKEN',
+    'GITHUB_TOKEN',
+  ]);
   if (AXIOM_MCP_TOKEN) {
     mcpConfig['axiom'] = {
       type: 'http',

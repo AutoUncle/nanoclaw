@@ -69,7 +69,11 @@ export class SlackChannel implements Channel {
   private botToken: string;
   private botUserId: string | undefined;
   private connected = false;
-  private outgoingQueue: Array<{ jid: string; text: string; threadTs?: string }> = [];
+  private outgoingQueue: Array<{
+    jid: string;
+    text: string;
+    threadTs?: string;
+  }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
 
@@ -114,7 +118,9 @@ export class SlackChannel implements Channel {
       .replace(/-{2,}/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 63);
-    return isValidGroupFolder(sanitized) ? sanitized : `slack-${channelId}`.slice(0, 63);
+    return isValidGroupFolder(sanitized)
+      ? sanitized
+      : `slack-${channelId}`.slice(0, 63);
   }
 
   /**
@@ -148,7 +154,9 @@ export class SlackChannel implements Channel {
 
       let channelName = event.channel;
       try {
-        const info = await this.app.client.conversations.info({ channel: event.channel });
+        const info = await this.app.client.conversations.info({
+          channel: event.channel,
+        });
         channelName = info.channel?.name || event.channel;
       } catch {
         // fall through with channel ID as name
@@ -164,7 +172,9 @@ export class SlackChannel implements Channel {
 
       let channelName = event.channel;
       try {
-        const info = await this.app.client.conversations.info({ channel: event.channel });
+        const info = await this.app.client.conversations.info({
+          channel: event.channel,
+        });
         channelName = info.channel?.name || event.channel;
       } catch {
         // fall through with channel ID as name
@@ -180,11 +190,13 @@ export class SlackChannel implements Channel {
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
       // Allow regular messages (no subtype), bot replies, and direct file uploads
-      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share') return;
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share')
+        return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
-      const files = (msg as HandledMessageEvent & { files?: SlackFile[] }).files;
+      const files = (msg as HandledMessageEvent & { files?: SlackFile[] })
+        .files;
 
       // Skip events with neither text nor file attachments
       if (!msg.text && !files?.length) return;
@@ -208,7 +220,9 @@ export class SlackChannel implements Channel {
         if ((msg.text || '').includes(mentionPattern)) {
           let channelName = msg.channel;
           try {
-            const info = await this.app.client.conversations.info({ channel: msg.channel });
+            const info = await this.app.client.conversations.info({
+              channel: msg.channel,
+            });
             channelName = info.channel?.name || msg.channel;
           } catch {
             // fall through with channel ID as name
@@ -255,7 +269,9 @@ export class SlackChannel implements Channel {
           msg.ts,
         );
         if (attachmentNote) {
-          content = content ? `${content}\n\n${attachmentNote}` : attachmentNote;
+          content = content
+            ? `${content}\n\n${attachmentNote}`
+            : attachmentNote;
         }
       }
 
@@ -296,7 +312,11 @@ export class SlackChannel implements Channel {
     await this.syncChannelMetadata();
   }
 
-  async sendMessage(jid: string, text: string, opts?: { threadTs?: string }): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    opts?: { threadTs?: string },
+  ): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
     const threadTs = opts?.threadTs;
 
@@ -312,7 +332,11 @@ export class SlackChannel implements Channel {
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text, thread_ts: threadTs });
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text,
+          thread_ts: threadTs,
+        });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
@@ -322,7 +346,10 @@ export class SlackChannel implements Channel {
           });
         }
       }
-      logger.info({ jid, length: text.length, threaded: !!threadTs }, 'Slack message sent');
+      logger.info(
+        { jid, length: text.length, threaded: !!threadTs },
+        'Slack message sent',
+      );
     } catch (err) {
       this.outgoingQueue.push({ jid, text, threadTs });
       logger.warn(
@@ -352,19 +379,35 @@ export class SlackChannel implements Channel {
     // no-op: Slack Bot API has no typing indicator endpoint
   }
 
-  async addReaction(jid: string, messageId: string, emoji: string): Promise<void> {
+  async addReaction(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
     try {
-      await this.app.client.reactions.add({ channel: channelId, timestamp: messageId, name: emoji });
+      await this.app.client.reactions.add({
+        channel: channelId,
+        timestamp: messageId,
+        name: emoji,
+      });
     } catch (err) {
       logger.debug({ jid, messageId, emoji, err }, 'Failed to add reaction');
     }
   }
 
-  async removeReaction(jid: string, messageId: string, emoji: string): Promise<void> {
+  async removeReaction(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
     try {
-      await this.app.client.reactions.remove({ channel: channelId, timestamp: messageId, name: emoji });
+      await this.app.client.reactions.remove({
+        channel: channelId,
+        timestamp: messageId,
+        name: emoji,
+      });
     } catch (err) {
       logger.debug({ jid, messageId, emoji, err }, 'Failed to remove reaction');
     }
@@ -447,21 +490,35 @@ export class SlackChannel implements Channel {
 
     for (const file of files) {
       if (!file.url_private_download) continue;
-      if (!SUPPORTED_MIMETYPES.has(file.mimetype) && !file.mimetype.startsWith('image/')) {
-        logger.debug({ name: file.name, mimetype: file.mimetype }, 'Skipping unsupported Slack file type');
+      if (
+        !SUPPORTED_MIMETYPES.has(file.mimetype) &&
+        !file.mimetype.startsWith('image/')
+      ) {
+        logger.debug(
+          { name: file.name, mimetype: file.mimetype },
+          'Skipping unsupported Slack file type',
+        );
         continue;
       }
       if (file.size && file.size > MAX_ATTACHMENT_BYTES) {
-        logger.warn({ name: file.name, size: file.size }, 'Skipping Slack attachment: too large');
-        lines.push(`[Attached file too large to download: ${file.name} (${Math.round(file.size / 1024 / 1024)}MB)]`);
+        logger.warn(
+          { name: file.name, size: file.size },
+          'Skipping Slack attachment: too large',
+        );
+        lines.push(
+          `[Attached file too large to download: ${file.name} (${Math.round(file.size / 1024 / 1024)}MB)]`,
+        );
         continue;
       }
 
-      const isImage = file.mimetype.startsWith('image/') && file.mimetype !== 'image/svg+xml';
+      const isImage =
+        file.mimetype.startsWith('image/') && file.mimetype !== 'image/svg+xml';
       const baseName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
       // Normalize images to JPEG so the Claude API can process them
       // (avoids wide-gamut ICC profile issues with macOS screenshots etc.)
-      const safeName = isImage ? baseName.replace(/\.[^.]+$/, '.jpg') : baseName;
+      const safeName = isImage
+        ? baseName.replace(/\.[^.]+$/, '.jpg')
+        : baseName;
       const destPath = path.join(attachmentsDir, safeName);
       const containerPath = `${containerAttachmentsDir}/${safeName}`;
 
@@ -495,9 +552,15 @@ export class SlackChannel implements Channel {
           fs.writeFileSync(destPath, buffer);
         }
         lines.push(`[Attached: ${file.name} → ${containerPath}]`);
-        logger.debug({ name: file.name, containerPath }, 'Downloaded Slack attachment');
+        logger.debug(
+          { name: file.name, containerPath },
+          'Downloaded Slack attachment',
+        );
       } catch (err) {
-        logger.warn({ name: file.name, err }, 'Failed to download Slack attachment');
+        logger.warn(
+          { name: file.name, err },
+          'Failed to download Slack attachment',
+        );
         lines.push(`[Attachment unavailable: ${file.name}]`);
       }
     }

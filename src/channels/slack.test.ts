@@ -1078,7 +1078,14 @@ describe('SlackChannel', () => {
 
       const event = createMessageEvent({
         text: 'hello',
-        files: [{ id: 'F003', name: 'nope.png', mimetype: 'image/png', filetype: 'png' }],
+        files: [
+          {
+            id: 'F003',
+            name: 'nope.png',
+            mimetype: 'image/png',
+            filetype: 'png',
+          },
+        ],
       });
       await triggerMessageEvent(event);
 
@@ -1101,7 +1108,8 @@ describe('SlackChannel', () => {
           {
             id: 'F004',
             name: 'data.xlsx',
-            mimetype: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            mimetype:
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             filetype: 'xlsx',
             url_private_download: 'https://files.slack.com/files/F004',
             size: 1024,
