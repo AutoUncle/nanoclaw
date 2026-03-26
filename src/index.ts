@@ -194,6 +194,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // Thread context: reply in the same thread as the triggering message (if any)
+  const lastMessage = missedMessages[missedMessages.length - 1];
+  const replyThreadTs = lastMessage.thread_ts;
+
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -209,6 +213,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+
+  // Add a reaction to the last triggering message so the user gets immediate feedback
+  const lastMessageId = missedMessages[missedMessages.length - 1].id;
+  await channel.addReaction?.(chatJid, lastMessageId, 'eyes');
+
   let hadError = false;
   let outputSentToUser = false;
 
@@ -223,7 +232,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await channel.sendMessage(chatJid, text, { threadTs: replyThreadTs });
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -232,14 +241,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
+      await channel.setTyping?.(chatJid, false);
+      await channel.removeReaction?.(chatJid, lastMessageId, 'eyes');
     }
 
     if (result.status === 'error') {
       hadError = true;
+      await channel.setTyping?.(chatJid, false);
+      await channel.removeReaction?.(chatJid, lastMessageId, 'eyes');
     }
   });
 
   await channel.setTyping?.(chatJid, false);
+  await channel.removeReaction?.(chatJid, lastMessageId, 'eyes');
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -538,6 +552,7 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
+    registerGroup,
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
       const trimmed = msg.content.trim();

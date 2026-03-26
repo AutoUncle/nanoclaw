@@ -1,3 +1,11 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "axiom": {
+      "type": "http",
+      "url": "https://axiom.autouncle.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${AXIOM_MCP_TOKEN}"
+      }
+    }
+  }
 }

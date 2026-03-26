@@ -16,6 +16,7 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -238,6 +239,18 @@ function buildContainerArgs(
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
+  // Pass through MCP tokens so the agent runner can configure MCP servers
+  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN, HONEYBADGER_PERSONAL_AUTH_TOKEN } = readEnvFile(['AXIOM_MCP_TOKEN', 'GITHUB_TOKEN', 'HONEYBADGER_PERSONAL_AUTH_TOKEN']);
+  if (AXIOM_MCP_TOKEN) {
+    args.push('-e', `AXIOM_MCP_TOKEN=${AXIOM_MCP_TOKEN}`);
+  }
+  if (GITHUB_TOKEN) {
+    args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
+  }
+  if (HONEYBADGER_PERSONAL_AUTH_TOKEN) {
+    args.push('-e', `HONEYBADGER_PERSONAL_AUTH_TOKEN=${HONEYBADGER_PERSONAL_AUTH_TOKEN}`);
+  }
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
@@ -274,6 +287,29 @@ export async function runContainerAgent(
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+
+  // Write .mcp.json into the group workspace so Claude Code picks it up automatically.
+  // This file is at /workspace/group/.mcp.json inside the container (the agent's cwd).
+  const mcpConfig: Record<string, unknown> = {};
+  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN } = readEnvFile(['AXIOM_MCP_TOKEN', 'GITHUB_TOKEN']);
+  if (AXIOM_MCP_TOKEN) {
+    mcpConfig['axiom'] = {
+      type: 'http',
+      url: 'https://axiom.autouncle.com/mcp',
+      headers: { Authorization: `Bearer ${AXIOM_MCP_TOKEN}` },
+    };
+  }
+  if (GITHUB_TOKEN) {
+    mcpConfig['github'] = {
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-github'],
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN },
+    };
+  }
+  fs.writeFileSync(
+    path.join(groupDir, '.mcp.json'),
+    JSON.stringify({ mcpServers: mcpConfig }, null, 2) + '\n',
+  );
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');

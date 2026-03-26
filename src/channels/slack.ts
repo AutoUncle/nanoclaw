@@ -1,17 +1,50 @@
+import fs from 'fs';
+import path from 'path';
+
+import sharp from 'sharp';
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
+import { isValidGroupFolder } from '../group-folder.js';
 import {
   Channel,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
 } from '../types.js';
+
+// Slack file attachment (files[] on message events)
+interface SlackFile {
+  id: string;
+  name: string;
+  title?: string;
+  mimetype: string;
+  filetype: string;
+  url_private_download?: string;
+  size?: number;
+}
+
+// Max file size to download (20 MB)
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+// MIME types the agent can usefully read (images + PDF + plain text)
+const SUPPORTED_MIMETYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/svg+xml',
+  'application/pdf',
+  'text/plain',
+  'text/csv',
+  'text/markdown',
+]);
 
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
 // Messages exceeding this are split into sequential chunks.
@@ -26,15 +59,17 @@ export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  registerGroup: (jid: string, group: RegisteredGroup) => void;
 }
 
 export class SlackChannel implements Channel {
   name = 'slack';
 
   private app: App;
+  private botToken: string;
   private botUserId: string | undefined;
   private connected = false;
-  private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private outgoingQueue: Array<{ jid: string; text: string; threadTs?: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
 
@@ -55,6 +90,8 @@ export class SlackChannel implements Channel {
       );
     }
 
+    this.botToken = botToken;
+
     this.app = new App({
       token: botToken,
       appToken,
@@ -65,19 +102,92 @@ export class SlackChannel implements Channel {
     this.setupEventHandlers();
   }
 
+  /**
+   * Derive a safe group folder name from a Slack channel name.
+   * Replaces any character outside [A-Za-z0-9_-] with '-', collapses
+   * consecutive dashes, strips leading/trailing dashes, and truncates to 63 chars.
+   * Falls back to the channel ID if the result is still invalid.
+   */
+  private toFolderName(channelName: string, channelId: string): string {
+    const sanitized = channelName
+      .replace(/[^A-Za-z0-9_-]/g, '-')
+      .replace(/-{2,}/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 63);
+    return isValidGroupFolder(sanitized) ? sanitized : `slack-${channelId}`.slice(0, 63);
+  }
+
+  /**
+   * Auto-register a Slack channel the bot has been added to or mentioned in.
+   * Always creates with isMain=false and requiresTrigger=true (safe defaults).
+   * No-op if the channel is already registered.
+   */
+  private autoRegisterChannel(channelId: string, channelName: string): void {
+    const jid = `slack:${channelId}`;
+    if (this.opts.registeredGroups()[jid]) return;
+
+    const folder = this.toFolderName(channelName || channelId, channelId);
+    const group: RegisteredGroup = {
+      name: channelName || channelId,
+      folder,
+      trigger: `@${ASSISTANT_NAME}`,
+      added_at: new Date().toISOString(),
+      isMain: false,
+      requiresTrigger: true,
+    };
+
+    logger.info({ jid, folder, channelName }, 'Auto-registering Slack channel');
+    this.opts.registerGroup(jid, group);
+  }
+
   private setupEventHandlers(): void {
+    // Auto-register when the bot is added to a channel
+    this.app.event('member_joined_channel', async ({ event }) => {
+      // Only act when the joining member is the bot itself
+      if (event.user !== this.botUserId) return;
+
+      let channelName = event.channel;
+      try {
+        const info = await this.app.client.conversations.info({ channel: event.channel });
+        channelName = info.channel?.name || event.channel;
+      } catch {
+        // fall through with channel ID as name
+      }
+
+      this.autoRegisterChannel(event.channel, channelName);
+    });
+
+    // Auto-register on first @mention in an unregistered channel
+    this.app.event('app_mention', async ({ event }) => {
+      const jid = `slack:${event.channel}`;
+      if (this.opts.registeredGroups()[jid]) return;
+
+      let channelName = event.channel;
+      try {
+        const info = await this.app.client.conversations.info({ channel: event.channel });
+        channelName = info.channel?.name || event.channel;
+      } catch {
+        // fall through with channel ID as name
+      }
+
+      this.autoRegisterChannel(event.channel, channelName);
+    });
+
     // Use app.event('message') instead of app.message() to capture all
     // message subtypes including bot_message (needed to track our own output)
     this.app.event('message', async ({ event }) => {
       // Bolt's event type is the full MessageEvent union (17+ subtypes).
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
-      if (subtype && subtype !== 'bot_message') return;
+      // Allow regular messages (no subtype), bot replies, and direct file uploads
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share') return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
+      const files = (msg as HandledMessageEvent & { files?: SlackFile[] }).files;
 
-      if (!msg.text) return;
+      // Skip events with neither text nor file attachments
+      if (!msg.text && !files?.length) return;
 
       // Threaded replies are flattened into the channel conversation.
       // The agent sees them alongside channel-level messages; responses
@@ -90,12 +200,28 @@ export class SlackChannel implements Channel {
       // Always report metadata for group discovery
       this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
 
+      // Auto-register on first @mention, in the message handler itself so the
+      // triggering message is never dropped (app_mention fires concurrently and
+      // can lose the race against this handler).
+      if (!this.opts.registeredGroups()[jid] && this.botUserId) {
+        const mentionPattern = `<@${this.botUserId}>`;
+        if ((msg.text || '').includes(mentionPattern)) {
+          let channelName = msg.channel;
+          try {
+            const info = await this.app.client.conversations.info({ channel: msg.channel });
+            channelName = info.channel?.name || msg.channel;
+          } catch {
+            // fall through with channel ID as name
+          }
+          this.autoRegisterChannel(msg.channel, channelName);
+        }
+      }
+
       // Only deliver full messages for registered groups
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
@@ -110,11 +236,26 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text;
+      let content = msg.text || '';
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
+        }
+      }
+
+      // Download file attachments and append paths so the agent can read them
+      if (files?.length && groups[jid]) {
+        const attachmentNote = await this.downloadAttachments(
+          files,
+          groups[jid].folder,
+          msg.ts,
+        );
+        if (attachmentNote) {
+          content = content ? `${content}\n\n${attachmentNote}` : attachmentNote;
         }
       }
 
@@ -127,6 +268,7 @@ export class SlackChannel implements Channel {
         timestamp,
         is_from_me: isBotMessage,
         is_bot_message: isBotMessage,
+        thread_ts: (msg as { thread_ts?: string }).thread_ts,
       });
     });
   }
@@ -142,10 +284,7 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
@@ -157,11 +296,12 @@ export class SlackChannel implements Channel {
     await this.syncChannelMetadata();
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, opts?: { threadTs?: string }): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
+    const threadTs = opts?.threadTs;
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text });
+      this.outgoingQueue.push({ jid, text, threadTs });
       logger.info(
         { jid, queueSize: this.outgoingQueue.length },
         'Slack disconnected, message queued',
@@ -172,18 +312,19 @@ export class SlackChannel implements Channel {
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        await this.app.client.chat.postMessage({ channel: channelId, text, thread_ts: threadTs });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
+            thread_ts: threadTs,
           });
         }
       }
-      logger.info({ jid, length: text.length }, 'Slack message sent');
+      logger.info({ jid, length: text.length, threaded: !!threadTs }, 'Slack message sent');
     } catch (err) {
-      this.outgoingQueue.push({ jid, text });
+      this.outgoingQueue.push({ jid, text, threadTs });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
@@ -209,6 +350,24 @@ export class SlackChannel implements Channel {
   // doesn't need channel-specific branching.
   async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
     // no-op: Slack Bot API has no typing indicator endpoint
+  }
+
+  async addReaction(jid: string, messageId: string, emoji: string): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    try {
+      await this.app.client.reactions.add({ channel: channelId, timestamp: messageId, name: emoji });
+    } catch (err) {
+      logger.debug({ jid, messageId, emoji, err }, 'Failed to add reaction');
+    }
+  }
+
+  async removeReaction(jid: string, messageId: string, emoji: string): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+    try {
+      await this.app.client.reactions.remove({ channel: channelId, timestamp: messageId, name: emoji });
+    } catch (err) {
+      logger.debug({ jid, messageId, emoji, err }, 'Failed to remove reaction');
+    }
   }
 
   /**
@@ -245,9 +404,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);
@@ -264,6 +421,90 @@ export class SlackChannel implements Channel {
     }
   }
 
+  /**
+   * Download Slack file attachments into the group's workspace so the agent
+   * can read them via the Read tool (supports images and PDFs natively).
+   * Returns a text block describing the attached files, or undefined on failure.
+   */
+  private async downloadAttachments(
+    files: SlackFile[],
+    groupFolder: string,
+    ts: string,
+  ): Promise<string | undefined> {
+    let groupDir: string;
+    try {
+      groupDir = resolveGroupFolderPath(groupFolder);
+    } catch {
+      return undefined;
+    }
+
+    // Use the message ts (sanitized) as the subdirectory name so paths are stable
+    const safeTs = ts.replace(/[^0-9]/g, '_');
+    const attachmentsDir = path.join(groupDir, 'attachments', safeTs);
+    const containerAttachmentsDir = `/workspace/group/attachments/${safeTs}`;
+
+    const lines: string[] = [];
+
+    for (const file of files) {
+      if (!file.url_private_download) continue;
+      if (!SUPPORTED_MIMETYPES.has(file.mimetype) && !file.mimetype.startsWith('image/')) {
+        logger.debug({ name: file.name, mimetype: file.mimetype }, 'Skipping unsupported Slack file type');
+        continue;
+      }
+      if (file.size && file.size > MAX_ATTACHMENT_BYTES) {
+        logger.warn({ name: file.name, size: file.size }, 'Skipping Slack attachment: too large');
+        lines.push(`[Attached file too large to download: ${file.name} (${Math.round(file.size / 1024 / 1024)}MB)]`);
+        continue;
+      }
+
+      const isImage = file.mimetype.startsWith('image/') && file.mimetype !== 'image/svg+xml';
+      const baseName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      // Normalize images to JPEG so the Claude API can process them
+      // (avoids wide-gamut ICC profile issues with macOS screenshots etc.)
+      const safeName = isImage ? baseName.replace(/\.[^.]+$/, '.jpg') : baseName;
+      const destPath = path.join(attachmentsDir, safeName);
+      const containerPath = `${containerAttachmentsDir}/${safeName}`;
+
+      try {
+        fs.mkdirSync(attachmentsDir, { recursive: true });
+        const response = await fetch(file.url_private_download, {
+          headers: { Authorization: `Bearer ${this.botToken}` },
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        // Slack returns 200 OK with an HTML login page when the bot token lacks
+        // the files:read scope — validate we got actual binary content, not HTML.
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.startsWith('text/html')) {
+          throw new Error(
+            'Slack returned HTML instead of file content (bot token may be missing files:read scope)',
+          );
+        }
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (isImage) {
+          // Convert to JPEG: normalizes image metadata and strips any unusual PNG
+          // chunks/profiles that cause "Could not process image" from the Claude API.
+          // flatten() handles transparency by compositing on white before JPEG encoding.
+          const jpeg = await sharp(buffer)
+            .flatten({ background: { r: 255, g: 255, b: 255 } })
+            .jpeg({ quality: 90 })
+            .toBuffer();
+          fs.writeFileSync(destPath, jpeg);
+        } else {
+          fs.writeFileSync(destPath, buffer);
+        }
+        lines.push(`[Attached: ${file.name} → ${containerPath}]`);
+        logger.debug({ name: file.name, containerPath }, 'Downloaded Slack attachment');
+      } catch (err) {
+        logger.warn({ name: file.name, err }, 'Failed to download Slack attachment');
+        lines.push(`[Attachment unavailable: ${file.name}]`);
+      }
+    }
+
+    return lines.length > 0 ? lines.join('\n') : undefined;
+  }
+
   private async flushOutgoingQueue(): Promise<void> {
     if (this.flushing || this.outgoingQueue.length === 0) return;
     this.flushing = true;
@@ -278,6 +519,7 @@ export class SlackChannel implements Channel {
         await this.app.client.chat.postMessage({
           channel: channelId,
           text: item.text,
+          thread_ts: item.threadTs,
         });
         logger.info(
           { jid: item.jid, length: item.text.length },
