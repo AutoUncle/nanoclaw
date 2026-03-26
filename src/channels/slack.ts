@@ -79,6 +79,14 @@ export class SlackChannel implements Channel {
 
   private opts: SlackChannelOpts;
 
+  /**
+   * Tracks thread root timestamps (thread_ts or ts) where the bot has been
+   * @mentioned. Once a thread is active, follow-up replies don't need a
+   * re-mention — the trigger is injected automatically.
+   * Stored in-memory; resets on process restart (re-mention reactivates).
+   */
+  private activeThreads = new Set<string>();
+
   constructor(opts: SlackChannelOpts) {
     this.opts = opts;
 
@@ -250,14 +258,28 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
+      //
+      // Thread-following: once the bot is @mentioned in a thread, subsequent
+      // replies in that thread inject the trigger automatically so the user
+      // doesn't need to re-mention on every message.
       let content = msg.text || '';
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (
-          content.includes(mentionPattern) &&
-          !TRIGGER_PATTERN.test(content)
-        ) {
-          content = `@${ASSISTANT_NAME} ${content}`;
+        const threadTs = (msg as { thread_ts?: string }).thread_ts;
+
+        if (content.includes(mentionPattern)) {
+          // Bot was @mentioned — mark this thread as active.
+          // Use thread_ts if replying inside a thread, or msg.ts if this is a
+          // channel-level message that may later become a thread root.
+          const threadRoot = threadTs || msg.ts;
+          this.activeThreads.add(threadRoot);
+          if (!TRIGGER_PATTERN.test(content)) {
+            content = `@${ASSISTANT_NAME} ${content}`;
+          }
+        } else if (threadTs && this.activeThreads.has(threadTs)) {
+          // Message in an active thread — inject trigger so the agent sees it,
+          // but mark it [passive] so the agent knows to respond only if meaningful.
+          content = `@${ASSISTANT_NAME} [passive] ${content}`;
         }
       }
 

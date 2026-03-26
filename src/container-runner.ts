@@ -249,25 +249,7 @@ async function buildContainerArgs(
     );
   }
 
-  // Pass through MCP tokens so the agent runner can configure MCP servers
-  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN, HONEYBADGER_PERSONAL_AUTH_TOKEN } =
-    readEnvFile([
-      'AXIOM_MCP_TOKEN',
-      'GITHUB_TOKEN',
-      'HONEYBADGER_PERSONAL_AUTH_TOKEN',
-    ]);
-  if (AXIOM_MCP_TOKEN) {
-    args.push('-e', `AXIOM_MCP_TOKEN=${AXIOM_MCP_TOKEN}`);
-  }
-  if (GITHUB_TOKEN) {
-    args.push('-e', `GITHUB_TOKEN=${GITHUB_TOKEN}`);
-  }
-  if (HONEYBADGER_PERSONAL_AUTH_TOKEN) {
-    args.push(
-      '-e',
-      `HONEYBADGER_PERSONAL_AUTH_TOKEN=${HONEYBADGER_PERSONAL_AUTH_TOKEN}`,
-    );
-  }
+  // All API credentials injected by OneCLI gateway for matching hosts
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
@@ -309,24 +291,17 @@ export async function runContainerAgent(
   // Write .mcp.json into the group workspace so Claude Code picks it up automatically.
   // This file is at /workspace/group/.mcp.json inside the container (the agent's cwd).
   const mcpConfig: Record<string, unknown> = {};
-  const { AXIOM_MCP_TOKEN, GITHUB_TOKEN } = readEnvFile([
-    'AXIOM_MCP_TOKEN',
-    'GITHUB_TOKEN',
-  ]);
-  if (AXIOM_MCP_TOKEN) {
-    mcpConfig['axiom'] = {
-      type: 'http',
-      url: 'https://axiom.autouncle.com/mcp',
-      headers: { Authorization: `Bearer ${AXIOM_MCP_TOKEN}` },
-    };
-  }
-  if (GITHUB_TOKEN) {
-    mcpConfig['github'] = {
-      command: 'npx',
-      args: ['-y', '@modelcontextprotocol/server-github'],
-      env: { GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN },
-    };
-  }
+  // Axiom MCP: auth injected by OneCLI gateway for axiom.autouncle.com
+  mcpConfig['axiom'] = {
+    type: 'http',
+    url: 'https://axiom.autouncle.com/mcp',
+  };
+  // GitHub MCP: real token injected by OneCLI gateway for api.github.com
+  mcpConfig['github'] = {
+    command: 'npx',
+    args: ['-y', '@modelcontextprotocol/server-github'],
+    env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'placeholder' },
+  };
   fs.writeFileSync(
     path.join(groupDir, '.mcp.json'),
     JSON.stringify({ mcpServers: mcpConfig }, null, 2) + '\n',

@@ -72,6 +72,17 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
+// Tracks the message ID that currently has the 👀 reaction for each JID.
+// Updated whenever a new reaction is added (both the initial container spawn
+// path and the piped-message path), so the removal callback always clears
+// the right message even when follow-up messages arrive mid-flight.
+const pendingReactionMsgId: Record<string, string> = {};
+
+// Tracks the thread_ts to reply into for each active JID.
+// Set at the start of each processGroupMessages call so IPC send_message
+// calls (which lack thread context) still land in the correct thread.
+const activeReplyThreadTs: Record<string, string | undefined> = {};
+
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
@@ -215,17 +226,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // For non-main groups, check if trigger is required and present
+  // For non-main groups, check if trigger is required and present.
+  // Capture the last triggering message so we can reply in the correct thread.
+  let replyThreadTs: string | undefined;
   if (!isMainGroup && group.requiresTrigger !== false) {
     const triggerPattern = getTriggerPattern(group.trigger);
     const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
+    let lastTriggerMsg: (typeof missedMessages)[0] | undefined;
+    for (const m of missedMessages) {
+      if (
         triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) return true;
+        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg))
+      ) {
+        lastTriggerMsg = m;
+      }
+    }
+    if (!lastTriggerMsg) return true;
+    // Reply where the conversation is now. If the trigger was inside a thread,
+    // use that thread. If the trigger was at channel level (no thread_ts), fall
+    // back to the last message's thread so we stay inside a thread that formed
+    // after the initial channel-level trigger.
+    replyThreadTs =
+      lastTriggerMsg.thread_ts ??
+      missedMessages[missedMessages.length - 1].thread_ts;
+  } else {
+    // Main groups: reply in the thread of the last message (if any)
+    replyThreadTs = missedMessages[missedMessages.length - 1].thread_ts;
   }
+
+  // Store so IPC send_message calls (mid-investigation) use the correct thread
+  activeReplyThreadTs[chatJid] = replyThreadTs;
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
@@ -240,10 +270,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     { group: group.name, messageCount: missedMessages.length },
     'Processing messages',
   );
-
-  // Thread context: reply in the same thread as the triggering message (if any)
-  const lastMessage = missedMessages[missedMessages.length - 1];
-  const replyThreadTs = lastMessage.thread_ts;
 
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -261,8 +287,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, true);
 
-  // Add a reaction to the last triggering message so the user gets immediate feedback
+  // Add a reaction to the last triggering message so the user gets immediate feedback.
+  // Store the ID in pendingReactionMsgId so the piped-message path can update it
+  // and the removal callback always clears the right message.
   const lastMessageId = missedMessages[missedMessages.length - 1].id;
+  pendingReactionMsgId[chatJid] = lastMessageId;
   await channel.addReaction?.(chatJid, lastMessageId, 'eyes');
 
   let hadError = false;
@@ -289,18 +318,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
       await channel.setTyping?.(chatJid, false);
-      await channel.removeReaction?.(chatJid, lastMessageId, 'eyes');
+      const reactionMsgId = pendingReactionMsgId[chatJid];
+      if (reactionMsgId) {
+        delete pendingReactionMsgId[chatJid];
+        await channel.removeReaction?.(chatJid, reactionMsgId, 'eyes');
+      }
     }
 
     if (result.status === 'error') {
       hadError = true;
       await channel.setTyping?.(chatJid, false);
-      await channel.removeReaction?.(chatJid, lastMessageId, 'eyes');
+      const reactionMsgId = pendingReactionMsgId[chatJid];
+      if (reactionMsgId) {
+        delete pendingReactionMsgId[chatJid];
+        await channel.removeReaction?.(chatJid, reactionMsgId, 'eyes');
+      }
     }
   });
 
   await channel.setTyping?.(chatJid, false);
-  await channel.removeReaction?.(chatJid, lastMessageId, 'eyes');
+  const finalReactionMsgId = pendingReactionMsgId[chatJid];
+  if (finalReactionMsgId) {
+    delete pendingReactionMsgId[chatJid];
+    await channel.removeReaction?.(chatJid, finalReactionMsgId, 'eyes');
+  }
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -496,6 +537,15 @@ async function startMessageLoop(): Promise<void> {
               ?.catch((err) =>
                 logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
               );
+            // Add 👀 reaction to the last piped message so the user sees the
+            // agent is working, even when no new container is being spawned.
+            const pipedLastMsg = messagesToSend[messagesToSend.length - 1];
+            pendingReactionMsgId[chatJid] = pipedLastMsg.id;
+            channel
+              .addReaction?.(chatJid, pipedLastMsg.id, 'eyes')
+              ?.catch((err) =>
+                logger.debug({ chatJid, err }, 'Failed to add piped reaction'),
+              );
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -683,7 +733,9 @@ async function main(): Promise<void> {
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       const text = formatOutbound(rawText, channel.name as ChannelType);
       if (!text) return Promise.resolve();
-      return channel.sendMessage(jid, text);
+      return channel.sendMessage(jid, text, {
+        threadTs: activeReplyThreadTs[jid],
+      });
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

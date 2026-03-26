@@ -12,7 +12,7 @@ import { ChannelOpts, registerChannel } from './registry.js';
 
 const GITHUB_JID = 'gh:prs';
 const GITHUB_FOLDER = 'github-prs';
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const POLL_INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 
 interface TrackedPR {
   owner: string;
@@ -24,6 +24,10 @@ interface TrackedPR {
   active: boolean;
   /** Whether we have sent the initial assignment notification */
   notified: boolean;
+  /** Head commit SHA — reset reportedFailedRuns when this changes */
+  headSha?: string;
+  /** Check run IDs already reported as failed — avoids duplicate notifications */
+  reportedFailedRuns?: number[];
 }
 
 interface GitHubState {
@@ -360,6 +364,79 @@ class GitHubChannel implements Channel {
     this.saveState();
   }
 
+  private async pollCIChecks(): Promise<void> {
+    for (const [key, tracked] of Object.entries(this.state.trackedPRs)) {
+      if (!tracked.active) continue;
+
+      const { owner, repo, number } = tracked;
+
+      try {
+        // Get current head SHA
+        const pr = (await this.githubGet(
+          `/repos/${owner}/${repo}/pulls/${number}`,
+        )) as { head?: { sha?: string } };
+        const headSha = pr.head?.sha;
+        if (!headSha) continue;
+
+        // Reset reported failures when a new commit is pushed
+        if (headSha !== tracked.headSha) {
+          tracked.headSha = headSha;
+          tracked.reportedFailedRuns = [];
+        }
+
+        const reported = tracked.reportedFailedRuns ?? [];
+
+        const data = (await this.githubGet(
+          `/repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`,
+        )) as {
+          check_runs?: Array<{
+            id: number;
+            name: string;
+            status: string;
+            conclusion: string | null;
+            html_url: string;
+            app?: { name?: string };
+          }>;
+        };
+
+        const failed = (data.check_runs ?? []).filter(
+          (r) =>
+            (r.conclusion === 'failure' || r.conclusion === 'timed_out') &&
+            !reported.includes(r.id),
+        );
+
+        if (failed.length > 0) {
+          const parts = [
+            `CI FAILURE ON PR: ${owner}/${repo}#${number}`,
+            `URL: https://github.com/${owner}/${repo}/pull/${number}`,
+            `Commit: ${headSha.slice(0, 7)}`,
+            ``,
+            `Failed checks (${failed.length}):`,
+            ...failed.map(
+              (r) =>
+                `  - ${r.name}${r.conclusion === 'timed_out' ? ' (timed out)' : ''}: ${r.html_url}`,
+            ),
+            ``,
+            `Please investigate the failures, fix the issues, and push a new commit.`,
+          ];
+          this.emitMessage(parts.join('\n'));
+
+          for (const r of failed) reported.push(r.id);
+          tracked.reportedFailedRuns = reported;
+
+          logger.info(
+            { key, headSha: headSha.slice(0, 7), count: failed.length },
+            'CI failures detected on PR',
+          );
+        }
+      } catch (err) {
+        logger.warn({ key, err }, 'Failed to poll CI checks for PR');
+      }
+    }
+
+    this.saveState();
+  }
+
   async connect(): Promise<void> {
     this.ensureGroupRegistered();
     this.connected = true;
@@ -370,6 +447,7 @@ class GitHubChannel implements Channel {
     this.pollTimer = setInterval(async () => {
       await this.pollAssignedPRs();
       await this.pollPRComments();
+      await this.pollCIChecks();
     }, POLL_INTERVAL_MS);
 
     logger.info({ username: this.username }, 'GitHub channel connected');
