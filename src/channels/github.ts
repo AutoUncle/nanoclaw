@@ -350,7 +350,9 @@ class GitHubChannel implements Channel {
               parts.push('');
             }
             if (botComments.length > 0) {
-              parts.push(`New general comments from bots: ${botComments.length}`);
+              parts.push(
+                `New general comments from bots: ${botComments.length}`,
+              );
             }
           }
           if (externalReviewComments.length > 0) {

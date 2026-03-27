@@ -391,6 +391,10 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const maxThinkingTokens = process.env.NANOCLAW_MAX_THINKING_TOKENS
+    ? parseInt(process.env.NANOCLAW_MAX_THINKING_TOKENS, 10)
+    : undefined;
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -401,6 +405,7 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
+      ...(maxThinkingTokens !== undefined ? { maxThinkingTokens } : {}),
       allowedTools: [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
