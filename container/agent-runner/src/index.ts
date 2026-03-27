@@ -443,7 +443,21 @@ async function runQuery(
   })) {
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+
+    if (message.type === 'assistant') {
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> } }).message?.content ?? [];
+      for (const block of content) {
+        if (block.type === 'text' && block.text) {
+          const snippet = block.text.replace(/\n/g, ' ').slice(0, 200);
+          log(`[msg #${messageCount}] assistant: ${snippet}${block.text.length > 200 ? '…' : ''}`);
+        } else if (block.type === 'tool_use') {
+          const inputStr = JSON.stringify(block.input ?? {}).slice(0, 150);
+          log(`[msg #${messageCount}] tool_use: ${block.name}(${inputStr})`);
+        }
+      }
+    } else {
+      log(`[msg #${messageCount}] type=${msgType}`);
+    }
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;

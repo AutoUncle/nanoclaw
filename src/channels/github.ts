@@ -333,12 +333,48 @@ class GitHubChannel implements Channel {
           }
 
           if (externalIssueComments.length > 0) {
-            parts.push(`New general comments: ${externalIssueComments.length}`);
+            const humanComments = externalIssueComments.filter(
+              (c) => !c.user?.login?.endsWith('[bot]'),
+            );
+            const botComments = externalIssueComments.filter((c) =>
+              c.user?.login?.endsWith('[bot]'),
+            );
+            if (humanComments.length > 0) {
+              parts.push(
+                `New general comments from humans (${humanComments.length}):`,
+              );
+              for (const c of humanComments) {
+                const snippet = (c.body ?? '').slice(0, 200);
+                parts.push(`  - ${c.user?.login ?? '?'}: ${snippet}`);
+              }
+              parts.push('');
+            }
+            if (botComments.length > 0) {
+              parts.push(`New general comments from bots: ${botComments.length}`);
+            }
           }
           if (externalReviewComments.length > 0) {
-            parts.push(
-              `New line-specific comments: ${externalReviewComments.length}`,
+            const humanReviewComments = externalReviewComments.filter(
+              (c) => !c.user?.login?.endsWith('[bot]'),
             );
+            const botReviewComments = externalReviewComments.filter((c) =>
+              c.user?.login?.endsWith('[bot]'),
+            );
+            if (humanReviewComments.length > 0) {
+              parts.push(
+                `New line-specific comments from humans (${humanReviewComments.length}):`,
+              );
+              for (const c of humanReviewComments) {
+                const snippet = (c.body ?? '').slice(0, 200);
+                parts.push(`  - ${c.user?.login ?? '?'}: ${snippet}`);
+              }
+              parts.push('');
+            }
+            if (botReviewComments.length > 0) {
+              parts.push(
+                `New line-specific comments from bots: ${botReviewComments.length}`,
+              );
+            }
           }
 
           parts.push('', 'Please review and address the new comments.');
@@ -395,6 +431,7 @@ class GitHubChannel implements Channel {
             status: string;
             conclusion: string | null;
             html_url: string;
+            details_url?: string;
             app?: { name?: string };
           }>;
         };
@@ -414,7 +451,7 @@ class GitHubChannel implements Channel {
             `Failed checks (${failed.length}):`,
             ...failed.map(
               (r) =>
-                `  - ${r.name}${r.conclusion === 'timed_out' ? ' (timed out)' : ''}: ${r.html_url}`,
+                `  - ${r.name}${r.conclusion === 'timed_out' ? ' (timed out)' : ''}: ${r.details_url ?? r.html_url}`,
             ),
             ``,
             `Please investigate the failures, fix the issues, and push a new commit.`,
