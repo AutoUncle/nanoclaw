@@ -245,10 +245,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Reply where the conversation is now. If the trigger was inside a thread,
     // use that thread. If the trigger was at channel level (no thread_ts), fall
     // back to the last message's thread so we stay inside a thread that formed
-    // after the initial channel-level trigger.
+    // after the initial channel-level trigger. If everything is at channel
+    // level (e.g. a fresh Slack @mention with no thread yet), start a thread
+    // under the trigger message so replies don't clutter the channel.
     replyThreadTs =
       lastTriggerMsg.thread_ts ??
-      missedMessages[missedMessages.length - 1].thread_ts;
+      missedMessages[missedMessages.length - 1].thread_ts ??
+      lastTriggerMsg.id;
   } else {
     // Main groups: reply in the thread of the last message (if any)
     replyThreadTs = missedMessages[missedMessages.length - 1].thread_ts;
@@ -546,6 +549,23 @@ async function startMessageLoop(): Promise<void> {
               ?.catch((err) =>
                 logger.debug({ chatJid, err }, 'Failed to add piped reaction'),
               );
+          } else if (queue.isShuttingDown()) {
+            // No active container and we're draining — notify the user rather
+            // than silently dropping their message. The message is still in the
+            // DB and will be processed after the restart completes.
+            const lastMsg = groupMessages[groupMessages.length - 1];
+            channel
+              .sendMessage(
+                chatJid,
+                "I'm currently restarting. I'll get back to you when I'm done!",
+                { threadTs: lastMsg.thread_ts },
+              )
+              .catch((err) =>
+                logger.warn(
+                  { chatJid, err },
+                  'Failed to send restarting notification',
+                ),
+              );
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -598,8 +618,8 @@ async function main(): Promise<void> {
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutdown signal received');
-    await queue.shutdown(10000);
+    logger.info({ signal }, 'Shutdown signal received, draining active jobs');
+    await queue.shutdown(5 * 60 * 1000); // wait up to 5 min for running jobs
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };

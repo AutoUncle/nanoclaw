@@ -55,6 +55,10 @@ export class GroupQueue {
     return state;
   }
 
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
   }
@@ -344,22 +348,42 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
-    const activeContainers: string[] = [];
-    for (const [_jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
-      }
+    if (this.activeCount === 0) {
+      logger.info('GroupQueue shutting down cleanly (no active jobs)');
+      return;
     }
 
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { activeCount: this.activeCount },
+      'Draining active jobs before shutdown — new jobs blocked',
     );
+
+    // Poll until all running containers finish naturally or the grace period expires.
+    // Containers are NOT killed; they complete on their own so no work is lost.
+    await new Promise<void>((resolve) => {
+      const deadline = Date.now() + gracePeriodMs;
+      const poll = () => {
+        if (this.activeCount === 0) {
+          logger.info('All jobs finished, shutdown ready');
+          resolve();
+        } else if (Date.now() >= deadline) {
+          const activeContainers: string[] = [];
+          for (const [_jid, state] of this.groups) {
+            if (state.containerName) activeContainers.push(state.containerName);
+          }
+          logger.warn(
+            { activeCount: this.activeCount, activeContainers },
+            'Drain timeout reached — exiting with containers still running (they will finish on their own)',
+          );
+          resolve();
+        } else {
+          setTimeout(poll, 500);
+        }
+      };
+      poll();
+    });
   }
 }
