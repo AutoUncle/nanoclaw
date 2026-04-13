@@ -136,7 +136,11 @@ export class SlackChannel implements Channel {
    * Always creates with isMain=false and requiresTrigger=true (safe defaults).
    * No-op if the channel is already registered.
    */
-  private autoRegisterChannel(channelId: string, channelName: string): void {
+  private autoRegisterChannel(
+    channelId: string,
+    channelName: string,
+    isDm = false,
+  ): void {
     const jid = `slack:${channelId}`;
     if (this.opts.registeredGroups()[jid]) return;
 
@@ -147,10 +151,14 @@ export class SlackChannel implements Channel {
       trigger: `@${ASSISTANT_NAME}`,
       added_at: new Date().toISOString(),
       isMain: false,
-      requiresTrigger: true,
+      // DMs don't need a trigger word — every message is for the bot
+      requiresTrigger: !isDm,
     };
 
-    logger.info({ jid, folder, channelName }, 'Auto-registering Slack channel');
+    logger.info(
+      { jid, folder, channelName, isDm },
+      'Auto-registering Slack channel',
+    );
     this.opts.registerGroup(jid, group);
   }
 
@@ -220,12 +228,14 @@ export class SlackChannel implements Channel {
       // Always report metadata for group discovery
       this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
 
-      // Auto-register on first @mention, in the message handler itself so the
-      // triggering message is never dropped (app_mention fires concurrently and
-      // can lose the race against this handler).
+      // Auto-register on first @mention for channels, or immediately for DMs.
+      // DMs don't require a mention — every message is implicitly directed at
+      // the bot. app_mention fires concurrently and can lose the race, so we
+      // also handle mention-based registration here.
       if (!this.opts.registeredGroups()[jid] && this.botUserId) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if ((msg.text || '').includes(mentionPattern)) {
+        const isDm = !isGroup;
+        if (isDm || (msg.text || '').includes(mentionPattern)) {
           let channelName = msg.channel;
           try {
             const info = await this.app.client.conversations.info({
@@ -235,7 +245,7 @@ export class SlackChannel implements Channel {
           } catch {
             // fall through with channel ID as name
           }
-          this.autoRegisterChannel(msg.channel, channelName);
+          this.autoRegisterChannel(msg.channel, channelName, isDm);
         }
       }
 
@@ -272,9 +282,22 @@ export class SlackChannel implements Channel {
           // Use thread_ts if replying inside a thread, or msg.ts if this is a
           // channel-level message that may later become a thread root.
           const threadRoot = threadTs || msg.ts;
+          const isFirstMention = !this.activeThreads.has(threadRoot);
           this.activeThreads.add(threadRoot);
           if (!TRIGGER_PATTERN.test(content)) {
             content = `@${ASSISTANT_NAME} ${content}`;
+          }
+          // First mention inside an existing thread: fetch prior messages so the
+          // agent has context for the conversation that happened before the mention.
+          if (isFirstMention && threadTs && threadTs !== msg.ts) {
+            const threadContext = await this.fetchThreadContext(
+              msg.channel,
+              threadTs,
+              msg.ts,
+            );
+            if (threadContext) {
+              content = `${threadContext}\n\n${content}`;
+            }
           }
         } else if (threadTs && this.activeThreads.has(threadTs)) {
           // Message in an active thread — inject trigger so the agent sees it,
@@ -588,6 +611,48 @@ export class SlackChannel implements Channel {
     }
 
     return lines.length > 0 ? lines.join('\n') : undefined;
+  }
+
+  /**
+   * Fetch messages that appeared in a thread before the current message.
+   * Called when the bot is first @mentioned in an existing thread so it has
+   * context for the conversation that happened without it.
+   * Returns a formatted context block, or undefined if there's nothing prior.
+   */
+  private async fetchThreadContext(
+    channel: string,
+    threadTs: string,
+    currentMsgTs: string,
+  ): Promise<string | undefined> {
+    try {
+      const result = await this.app.client.conversations.replies({
+        channel,
+        ts: threadTs,
+      });
+
+      // Keep only messages that were sent before the current @mention
+      const prior = (result.messages || []).filter(
+        (m) => m.ts && m.ts < currentMsgTs,
+      );
+      if (prior.length === 0) return undefined;
+
+      const lines: string[] = ['[Thread context — messages before this mention:]'];
+      for (const m of prior) {
+        const isBotMsg = !!m.bot_id || m.user === this.botUserId;
+        const senderName = isBotMsg
+          ? ASSISTANT_NAME
+          : (m.user
+              ? (await this.resolveUserName(m.user)) ?? m.user
+              : 'unknown');
+        lines.push(`${senderName}: ${m.text || ''}`);
+      }
+      lines.push('[End of thread context]');
+
+      return lines.join('\n');
+    } catch (err) {
+      logger.debug({ channel, threadTs, err }, 'Failed to fetch thread context');
+      return undefined;
+    }
   }
 
   private async flushOutgoingQueue(): Promise<void> {
