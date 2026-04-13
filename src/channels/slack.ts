@@ -636,21 +636,26 @@ export class SlackChannel implements Channel {
       );
       if (prior.length === 0) return undefined;
 
-      const lines: string[] = ['[Thread context — messages before this mention:]'];
+      const lines: string[] = [
+        '[Thread context — messages before this mention:]',
+      ];
       for (const m of prior) {
         const isBotMsg = !!m.bot_id || m.user === this.botUserId;
         const senderName = isBotMsg
           ? ASSISTANT_NAME
-          : (m.user
-              ? (await this.resolveUserName(m.user)) ?? m.user
-              : 'unknown');
+          : m.user
+            ? ((await this.resolveUserName(m.user)) ?? m.user)
+            : 'unknown';
         lines.push(`${senderName}: ${m.text || ''}`);
       }
       lines.push('[End of thread context]');
 
       return lines.join('\n');
     } catch (err) {
-      logger.debug({ channel, threadTs, err }, 'Failed to fetch thread context');
+      logger.debug(
+        { channel, threadTs, err },
+        'Failed to fetch thread context',
+      );
       return undefined;
     }
   }
