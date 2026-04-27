@@ -88,23 +88,75 @@ const queue = new GroupQueue();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
+// Cached OneCLI secret IDs, resolved once at startup via resolveOneCLISecrets().
+let onecliSecretIds: {
+  anthropic?: string;
+  github?: string;
+  linear?: string;
+} = {};
+
+async function resolveOneCLISecrets(): Promise<void> {
+  try {
+    const res = await fetch(`${ONECLI_URL}/api/secrets`);
+    if (!res.ok) return;
+    const secrets = (await res.json()) as Array<{ id: string; hostPattern: string }>;
+    for (const s of secrets) {
+      if (s.hostPattern === 'api.anthropic.com') onecliSecretIds.anthropic = s.id;
+      else if (s.hostPattern === 'api.github.com') onecliSecretIds.github = s.id;
+      else if (s.hostPattern === 'api.linear.app') onecliSecretIds.linear = s.id;
+    }
+    logger.info({ onecliSecretIds }, 'OneCLI secret IDs resolved');
+  } catch (err) {
+    logger.warn({ err }, 'Failed to resolve OneCLI secret IDs');
+  }
+}
+
+async function assignOneCLISecrets(
+  agentId: string,
+  jid: string,
+): Promise<void> {
+  const ids: string[] = [];
+  if (onecliSecretIds.anthropic) ids.push(onecliSecretIds.anthropic);
+  if (onecliSecretIds.github) ids.push(onecliSecretIds.github);
+  if (jid.startsWith('slack:') && onecliSecretIds.linear)
+    ids.push(onecliSecretIds.linear);
+  if (ids.length === 0) return;
+  const res = await fetch(`${ONECLI_URL}/api/agents/${agentId}/secrets`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secretIds: ids }),
+  });
+  if (!res.ok) {
+    throw new Error(`OneCLI set-secrets returned ${res.status}`);
+  }
+}
+
 function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
   if (group.isMain) return;
   const identifier = group.folder.toLowerCase().replace(/_/g, '-');
-  onecli.ensureAgent({ name: group.name, identifier }).then(
-    (res) => {
-      logger.info(
-        { jid, identifier, created: res.created },
-        'OneCLI agent ensured',
-      );
-    },
-    (err) => {
+  onecli
+    .createAgent({ name: group.name, identifier })
+    .then(async (res) => {
+      logger.info({ jid, identifier, id: res.id }, 'OneCLI agent created');
+      await assignOneCLISecrets(res.id, jid);
+      logger.info({ jid, identifier }, 'OneCLI agent secrets assigned');
+    })
+    .catch((err) => {
+      // 409 = agent already exists, which is fine
+      if (
+        err &&
+        typeof err === 'object' &&
+        'statusCode' in err &&
+        (err as { statusCode: number }).statusCode === 409
+      ) {
+        logger.debug({ jid, identifier }, 'OneCLI agent already exists');
+        return;
+      }
       logger.debug(
         { jid, identifier, err: String(err) },
         'OneCLI agent ensure skipped',
       );
-    },
-  );
+    });
 }
 
 function loadState(): void {
@@ -608,6 +660,8 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
+  await resolveOneCLISecrets();
+
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).
   for (const [jid, group] of Object.entries(registeredGroups)) {
@@ -755,6 +809,30 @@ async function main(): Promise<void> {
       if (!text) return Promise.resolve();
       return channel.sendMessage(jid, text, {
         threadTs: activeReplyThreadTs[jid],
+      });
+    },
+    sendFile: (jid, filePath, opts) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendFile) {
+        // Channel doesn't support file uploads — fall back to text message
+        const text = opts?.message
+          ? formatOutbound(opts.message, channel.name as ChannelType)
+          : '';
+        if (text) {
+          return channel.sendMessage(jid, text, {
+            threadTs: opts?.threadTs ?? activeReplyThreadTs[jid],
+          });
+        }
+        return Promise.resolve();
+      }
+      const message = opts?.message
+        ? formatOutbound(opts.message, channel.name as ChannelType)
+        : undefined;
+      return channel.sendFile(jid, filePath, {
+        threadTs: opts?.threadTs ?? activeReplyThreadTs[jid],
+        title: opts?.title,
+        message: message || undefined,
       });
     },
     registeredGroups: () => registeredGroups,

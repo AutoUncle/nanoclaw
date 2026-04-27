@@ -98,6 +98,12 @@ export interface Channel {
   // Optional: react to a specific message (e.g. emoji reaction on Slack).
   addReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
   removeReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
+  // Optional: upload a file to a chat (e.g. Slack filesUploadV2).
+  sendFile?(
+    jid: string,
+    filePath: string,
+    opts?: { threadTs?: string; title?: string; message?: string },
+  ): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

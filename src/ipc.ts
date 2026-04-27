@@ -6,12 +6,41 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
+/**
+ * Resolve a container-internal file path to the corresponding host path.
+ * Container mounts: /workspace/group → groups/{folder}
+ * Returns undefined if the path doesn't start with a known container prefix.
+ */
+function resolveContainerPath(
+  containerPath: string,
+  groupFolder: string,
+): string | undefined {
+  const prefix = '/workspace/group/';
+  if (!containerPath.startsWith(prefix)) return undefined;
+  const relativePath = containerPath.slice(prefix.length);
+  // Prevent path traversal
+  if (relativePath.includes('..') || path.isAbsolute(relativePath)) {
+    return undefined;
+  }
+  try {
+    const groupDir = resolveGroupFolderPath(groupFolder);
+    return path.join(groupDir, relativePath);
+  } catch {
+    return undefined;
+  }
+}
+
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendFile: (
+    jid: string,
+    filePath: string,
+    opts?: { threadTs?: string; title?: string; message?: string },
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -81,7 +110,30 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  // Resolve container file path to host path and upload if present
+                  if (data.filePath) {
+                    const hostFilePath = resolveContainerPath(
+                      data.filePath,
+                      sourceGroup,
+                    );
+                    if (hostFilePath && fs.existsSync(hostFilePath)) {
+                      await deps.sendFile(data.chatJid, hostFilePath, {
+                        message: data.text,
+                      });
+                      logger.info(
+                        { chatJid: data.chatJid, sourceGroup, hostFilePath },
+                        'IPC file uploaded',
+                      );
+                    } else {
+                      logger.warn(
+                        { chatJid: data.chatJid, containerPath: data.filePath, hostFilePath },
+                        'IPC file not found on host, sending text only',
+                      );
+                      await deps.sendMessage(data.chatJid, data.text);
+                    }
+                  } else {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',

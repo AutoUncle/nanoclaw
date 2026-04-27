@@ -284,9 +284,6 @@ export class SlackChannel implements Channel {
           const threadRoot = threadTs || msg.ts;
           const isFirstMention = !this.activeThreads.has(threadRoot);
           this.activeThreads.add(threadRoot);
-          if (!TRIGGER_PATTERN.test(content)) {
-            content = `@${ASSISTANT_NAME} ${content}`;
-          }
           // First mention inside an existing thread: fetch prior messages so the
           // agent has context for the conversation that happened before the mention.
           if (isFirstMention && threadTs && threadTs !== msg.ts) {
@@ -298,6 +295,11 @@ export class SlackChannel implements Channel {
             if (threadContext) {
               content = `${threadContext}\n\n${content}`;
             }
+          }
+          // Inject trigger AFTER thread context assembly so the trigger is
+          // always at the start of the final content (^@trigger\b must match).
+          if (!TRIGGER_PATTERN.test(content)) {
+            content = `@${ASSISTANT_NAME} ${content}`;
           }
         } else if (threadTs && this.activeThreads.has(threadTs)) {
           // Message in an active thread — inject trigger so the agent sees it,
@@ -422,6 +424,48 @@ export class SlackChannel implements Channel {
   // doesn't need channel-specific branching.
   async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
     // no-op: Slack Bot API has no typing indicator endpoint
+  }
+
+  async sendFile(
+    jid: string,
+    filePath: string,
+    opts?: { threadTs?: string; title?: string; message?: string },
+  ): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+
+    if (!fs.existsSync(filePath)) {
+      logger.warn({ jid, filePath }, 'sendFile: file not found');
+      return;
+    }
+
+    try {
+      const fileBuffer = fs.readFileSync(filePath);
+      const common = {
+        channel_id: channelId,
+        file: fileBuffer,
+        filename: path.basename(filePath),
+        title: opts?.title || path.basename(filePath),
+        ...(opts?.message ? { initial_comment: opts.message } : {}),
+      };
+      await (opts?.threadTs
+        ? this.app.client.filesUploadV2({
+            ...common,
+            thread_ts: opts.threadTs,
+          })
+        : this.app.client.filesUploadV2(common));
+      logger.info(
+        { jid, filePath, threaded: !!opts?.threadTs },
+        'Slack file uploaded',
+      );
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to upload file to Slack');
+      // Fall back to sending the message text without the file
+      if (opts?.message) {
+        await this.sendMessage(jid, opts.message, {
+          threadTs: opts.threadTs,
+        });
+      }
+    }
   }
 
   async addReaction(

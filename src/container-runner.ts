@@ -194,13 +194,21 @@ function buildVolumeMounts(
     'agent-runner-src',
   );
   if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
+    // Compare newest mtime across ALL source files (not just index.ts) so
+    // changes to ipc-mcp-stdio.ts or any other file invalidate the cache.
+    const newestSrcMtime = fs
+      .readdirSync(agentRunnerSrc)
+      .filter((f) => f.endsWith('.ts'))
+      .reduce((max, f) => {
+        const mt = fs.statSync(path.join(agentRunnerSrc, f)).mtimeMs;
+        return mt > max ? mt : max;
+      }, 0);
     const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
+    const cachedMtime = fs.existsSync(cachedIndex)
+      ? fs.statSync(cachedIndex).mtimeMs
+      : 0;
     const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+      !fs.existsSync(groupAgentRunnerDir) || newestSrcMtime > cachedMtime;
     if (needsCopy) {
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
     }
@@ -302,6 +310,14 @@ export async function runContainerAgent(
     args: ['-y', '@modelcontextprotocol/server-github'],
     env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'placeholder' },
   };
+  // Linear MCP: available to Slack agents, auth injected by OneCLI gateway for api.linear.app
+  if (input.chatJid.startsWith('slack:')) {
+    mcpConfig['linear'] = {
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-linear'],
+      env: { LINEAR_API_KEY: 'placeholder' },
+    };
+  }
   fs.writeFileSync(
     path.join(groupDir, '.mcp.json'),
     JSON.stringify({ mcpServers: mcpConfig }, null, 2) + '\n',
